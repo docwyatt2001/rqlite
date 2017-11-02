@@ -46,7 +46,7 @@ const logo = `
 
 // These variables are populated via the Go linker.
 var (
-	version   = "4"
+	version   = "5"
 	commit    = "unknown"
 	branch    = "unknown"
 	buildtime = "unknown"
