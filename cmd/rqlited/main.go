@@ -233,8 +233,12 @@ func main() {
 		log.Println("node is already member of cluster, skip determining join addresses")
 	}
 
-	// Now, open it.
-	if err := str.Open(len(joins) == 0); err != nil {
+	// Open the store.
+	nodeID, err = node()
+	if err != nil {
+		log.Fatalf("failed to determine node ID: %s", err.Error())
+	}
+	if err := str.Open(len(joins) == 0, nodeID); err != nil {
 		log.Fatalf("failed to open store: %s", err.Error())
 	}
 
@@ -389,7 +393,10 @@ func credentialStore() (*auth.CredentialsStore, error) {
 }
 
 func nodeID() (string, error) {
-	return nodeID
+	if nodeID != "" {
+		return nodeID, nil
+	}
+	return os.Hostname()
 }
 
 // prof stores the file locations of active profiles.
