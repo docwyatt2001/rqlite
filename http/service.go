@@ -288,18 +288,18 @@ func (s *Service) handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(m) != 1 {
+	remoteID, ok := m["id"]
+	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
 	remoteAddr, ok := m["addr"]
 	if !ok {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	if err := s.store.Join(remoteAddr); err != nil {
+	if err := s.store.Join(remoteID, remoteAddr); err != nil {
 		if err == store.ErrNotLeader {
 			leader := s.store.Peer(s.store.Leader())
 			if leader == "" {

@@ -206,7 +206,7 @@ func New(c *StoreConfig) *Store {
 
 // Open opens the store. If enableSingle is set, and there are no existing peers,
 // then this node becomes the first node, and therefore leader, of the cluster.
-func (s *Store) Open(enableSingle bool) error {
+func (s *Store) Open(enableSingle bool, nodeID string) error {
 	if err := os.MkdirAll(s.raftDir, 0755); err != nil {
 		return err
 	}
@@ -227,6 +227,7 @@ func (s *Store) Open(enableSingle bool) error {
 
 	// Get the Raft configuration for this store.
 	config := s.raftConfig()
+	config.LocalID = raft.ServerID(nodeID)
 
 	// Check for any existing peers.
 	peers, err := s.peerStore.Peers()
@@ -557,15 +558,15 @@ func (s *Store) UpdateAPIPeers(peers map[string]string) error {
 	return f.Error()
 }
 
-// Join joins a node, located at addr, to this store. The node must be ready to
-// respond to Raft communications at that address.
-func (s *Store) Join(addr string) error {
+// Join joins a node, identified by id and located at addr, to this store.
+// The node must be ready to respond to Raft communications at that address.
+func (s *Store) Join(id, addr string) error {
 	s.logger.Printf("received request to join node at %s", addr)
 	if s.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
 
-	f := s.raft.AddPeer(addr)
+	f := s.raft.AddVoter(raft.ServerID(nodeID), raft.ServerAddress(addr), 0, 0)
 	if e := f.(raft.Future); e.Error() != nil {
 		if e.Error() == raft.ErrNotLeader {
 			return ErrNotLeader
