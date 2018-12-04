@@ -13,9 +13,9 @@ If you open a pull request, please ensure the commit history is clean. Squash th
 Please avoid using libaries other than those available in the standard library, unless absolutely necessary. This requirement is relaxed somewhat for software other than rqlite node software itself. To understand why this approach is taken, check out this [post](https://blog.gopheracademy.com/advent-2014/case-against-3pl/).
 
 ## Building rqlite
-*Building rqlite requires Go 1.9 or later. [gvm](https://github.com/moovweb/gvm) is a great tool for installing and managing your versions of Go.*
+*Building rqlite requires Go 1.10 or later. [gvm](https://github.com/moovweb/gvm) is a great tool for installing and managing your versions of Go.*
 
-Download, build, and run rqlite like so (tested on 64-bit Kubuntu 14.04 and OSX):
+Download, build, and run rqlite like so (tested on 64-bit Kubuntu 16.0 and OSX):
 
 ```bash
 mkdir rqlite # Or any directory of your choice.
@@ -42,6 +42,9 @@ It can be rather slow to rebuild rqlite, due to the repeated compilation of SQLi
 cd $GOPATH
 go install github.com/mattn/go-sqlite3
 ```
+
+### Enabling specific features of SQLite
+The prebuilt images of rqlite may not have the features enabled that you want. The Go build system does allow you to enable certain build flags, but you'll need to build your own image. For example, check out a [Google Groups discussion](https://groups.google.com/forum/?lutm_source=footer#!topic/rqlite/ySd1kCyB2PY), showing how to build Diacritical support.
 
 ## Cloning a fork
 If you wish to work with fork of rqlite, your own fork for example, you must still follow the directory structure above. But instead of cloning the main repo, instead clone your fork. You must fork the project if you want to contribute upstream.
@@ -71,4 +74,7 @@ ok      github.com/rqlite/rqlite/http  0.006s
 ok      github.com/rqlite/rqlite/store 6.117s
 ok      github.com/rqlite/rqlite/system_test   7.853s
 ```
+
+## What does "ABL" mean in commit messages?
+_Always be linting_.
 

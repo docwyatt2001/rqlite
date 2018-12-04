@@ -16,6 +16,8 @@ func (t *testBasicAuther) BasicAuth() (string, string, bool) {
 }
 
 func Test_AuthLoadSingle(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{"username": "username1", "password": "password1"}
@@ -43,6 +45,8 @@ func Test_AuthLoadSingle(t *testing.T) {
 }
 
 func Test_AuthLoadMultiple(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{"username": "username1", "password": "password1"},
@@ -81,6 +85,8 @@ func Test_AuthLoadMultiple(t *testing.T) {
 }
 
 func Test_AuthLoadSingleRequest(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{"username": "username1", "password": "password1"}
@@ -116,6 +122,8 @@ func Test_AuthLoadSingleRequest(t *testing.T) {
 }
 
 func Test_AuthPermsLoadSingle(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{
@@ -160,9 +168,86 @@ func Test_AuthPermsLoadSingle(t *testing.T) {
 	if perm := store.HasPerm("username2", "baz"); !perm {
 		t.Fatalf("username1 does not have baz perm")
 	}
+
+	if perm := store.HasAnyPerm("username1", "foo"); !perm {
+		t.Fatalf("username1 does not have foo perm")
+	}
+	if perm := store.HasAnyPerm("username1", "bar"); !perm {
+		t.Fatalf("username1 does not have bar perm")
+	}
+	if perm := store.HasAnyPerm("username1", "foo", "bar"); !perm {
+		t.Fatalf("username1 does not have foo or bar perm")
+	}
+	if perm := store.HasAnyPerm("username1", "foo", "qux"); !perm {
+		t.Fatalf("username1 does not have foo or qux perm")
+	}
+	if perm := store.HasAnyPerm("username1", "qux", "bar"); !perm {
+		t.Fatalf("username1 does not have bar perm")
+	}
+	if perm := store.HasAnyPerm("username1", "baz", "qux"); perm {
+		t.Fatalf("username1 has baz or qux perm")
+	}
+}
+
+func Test_AuthLoadHashedSingleRequest(t *testing.T) {
+	t.Parallel()
+
+	const jsonStream = `
+		[
+			{
+				"username": "username1",
+				"password": "$2a$10$fKRHxrEuyDTP6tXIiDycr.nyC8Q7UMIfc31YMyXHDLgRDyhLK3VFS"
+			},
+			{	"username": "username2",
+				"password": "password2"
+			}
+		]
+	`
+
+	store := NewCredentialsStore()
+	if err := store.Load(strings.NewReader(jsonStream)); err != nil {
+		t.Fatalf("failed to load multiple credentials: %s", err.Error())
+	}
+
+	b1 := &testBasicAuther{
+		username: "username1",
+		password: "password1",
+		ok:       true,
+	}
+	b2 := &testBasicAuther{
+		username: "username2",
+		password: "password2",
+		ok:       true,
+	}
+
+	b3 := &testBasicAuther{
+		username: "username1",
+		password: "wrong",
+		ok:       true,
+	}
+	b4 := &testBasicAuther{
+		username: "username2",
+		password: "wrong",
+		ok:       true,
+	}
+
+	if check := store.CheckRequest(b1); !check {
+		t.Fatalf("username1 (b1) credential not checked correctly via request")
+	}
+	if check := store.CheckRequest(b2); !check {
+		t.Fatalf("username2 (b2) credential not checked correctly via request")
+	}
+	if check := store.CheckRequest(b3); check {
+		t.Fatalf("username1 (b3) credential not checked correctly via request")
+	}
+	if check := store.CheckRequest(b4); check {
+		t.Fatalf("username2 (b4) credential not checked correctly via request")
+	}
 }
 
 func Test_AuthPermsRequestLoadSingle(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{
@@ -202,6 +287,8 @@ func Test_AuthPermsRequestLoadSingle(t *testing.T) {
 }
 
 func Test_AuthPermsEmptyLoadSingle(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{
@@ -230,6 +317,8 @@ func Test_AuthPermsEmptyLoadSingle(t *testing.T) {
 }
 
 func Test_AuthPermsNilLoadSingle(t *testing.T) {
+	t.Parallel()
+
 	const jsonStream = `
 		[
 			{

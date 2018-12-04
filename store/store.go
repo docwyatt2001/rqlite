@@ -8,19 +8,21 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"net"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/raft-boltdb"
-	sql "github.com/rqlite/rqlite/db"
+	sdb "github.com/rqlite/rqlite/db"
 )
 
 var (
@@ -31,24 +33,99 @@ var (
 	// ErrOpenTimeout is returned when the Store does not apply its initial
 	// logs within the specified time.
 	ErrOpenTimeout = errors.New("timeout waiting for initial logs application")
+
+	// ErrInvalidBackupFormat is returned when the requested backup format
+	// is not valid.
+	ErrInvalidBackupFormat = errors.New("invalid backup format")
+
+	// ErrTransactionActive is returned when an operation is blocked by an
+	// active transaction.
+	ErrTransactionActive = errors.New("transaction in progress")
+
+	// ErrDefaultConnection is returned when an attempt is made to delete the
+	// default connection.
+	ErrDefaultConnection = errors.New("cannot delete default connection")
+
+	// ErrConnectionDoesNotExist is returned when an operation is attempted
+	// on a non-existent connection. This can happen if the connection
+	// was previously open but is now closed.
+	ErrConnectionDoesNotExist = errors.New("connection does not exist")
+
+	// ErrStoreInvalidState is returned when a Store is in an invalid
+	// state for the requested operation.
+	ErrStoreInvalidState = errors.New("store not in valid state")
 )
 
 const (
-	retainSnapshotCount = 2
-	applyTimeout        = 10 * time.Second
-	openTimeout         = 120 * time.Second
-	sqliteFile          = "db.sqlite"
-	leaderWaitDelay     = 100 * time.Millisecond
-	appliedWaitDelay    = 100 * time.Millisecond
+	connectionPollPeriod = 10 * time.Second
+	retainSnapshotCount  = 2
+	applyTimeout         = 10 * time.Second
+	openTimeout          = 120 * time.Second
+	sqliteFile           = "db.sqlite"
+	leaderWaitDelay      = 100 * time.Millisecond
+	appliedWaitDelay     = 100 * time.Millisecond
+	connectionPoolCount  = 5
+	connectionTimeout    = 10 * time.Second
+	raftLogCacheSize     = 512
 )
+
+const (
+	numSnaphots        = "num_snapshots"
+	numSnaphotsBlocked = "num_snapshots_blocked"
+	numBackups         = "num_backups"
+	numRestores        = "num_restores"
+	numConnects        = "num_connects"
+	numDisconnects     = "num_disconnects"
+	numConnTimeouts    = "num_conn_timeouts"
+)
+
+const defaultConnID = 0
+
+// BackupFormat represents the backup formats supported by the Store.
+type BackupFormat int
+
+const (
+	// BackupSQL is dump of the database in SQL text format.
+	BackupSQL BackupFormat = iota
+
+	// BackupBinary is a copy of the SQLite database file.
+	BackupBinary
+)
+
+// stats captures stats for the Store.
+var stats *expvar.Map
+
+func init() {
+	stats = expvar.NewMap("store")
+	stats.Add(numSnaphots, 0)
+	stats.Add(numBackups, 0)
+	stats.Add(numRestores, 0)
+	stats.Add(numConnects, 0)
+	stats.Add(numDisconnects, 0)
+	stats.Add(numConnTimeouts, 0)
+}
+
+// RaftResponse is the Raft metadata that will be included with responses, if
+// the associated request modified the Raft log.
+type RaftResponse struct {
+	Index  uint64 `json:"index,omitempty"`
+	NodeID string `json:"node_id,omitempty"`
+}
 
 // QueryRequest represents a query that returns rows, and does not modify
 // the database.
 type QueryRequest struct {
 	Queries []string
 	Timings bool
-	Tx      bool
+	Atomic  bool
 	Lvl     ConsistencyLevel
+}
+
+// QueryResponse encapsulates a response to a query.
+type QueryResponse struct {
+	Rows []*sdb.Rows
+	Time float64
+	Raft *RaftResponse
 }
 
 // ExecuteRequest represents a query that returns now rows, but does modify
@@ -56,52 +133,15 @@ type QueryRequest struct {
 type ExecuteRequest struct {
 	Queries []string
 	Timings bool
-	Tx      bool
+	Atomic  bool
 }
 
-// Transport is the interface the network service must provide.
-type Transport interface {
-	net.Listener
-
-	// Dial is used to create a new outgoing connection
-	Dial(address string, timeout time.Duration) (net.Conn, error)
+// ExecuteResponse encapsulates a response to an execute.
+type ExecuteResponse struct {
+	Results []*sdb.Result
+	Time    float64
+	Raft    RaftResponse
 }
-
-// commandType are commands that affect the state of the cluster, and must go through Raft.
-type commandType int
-
-const (
-	execute commandType = iota // Commands which modify the database.
-	query                      // Commands which query the database.
-	peer                       // Commands that modify peers map.
-)
-
-type command struct {
-	Typ commandType     `json:"typ,omitempty"`
-	Sub json.RawMessage `json:"sub,omitempty"`
-}
-
-func newCommand(t commandType, d interface{}) (*command, error) {
-	b, err := json.Marshal(d)
-	if err != nil {
-		return nil, err
-	}
-	return &command{
-		Typ: t,
-		Sub: b,
-	}, nil
-
-}
-
-// databaseSub is a command sub which involves interaction with the database.
-type databaseSub struct {
-	Tx      bool     `json:"tx,omitempty"`
-	Queries []string `json:"queries,omitempty"`
-	Timings bool     `json:"timings,omitempty"`
-}
-
-// peersSub is a command which sets the API address for a Raft address.
-type peersSub map[string]string
 
 // ConsistencyLevel represents the available read consistency levels.
 type ConsistencyLevel int
@@ -125,140 +165,120 @@ const (
 	Unknown
 )
 
-// clusterMeta represents cluster meta which must be kept in consensus.
-type clusterMeta struct {
-	APIPeers map[string]string // Map from Raft address to API address
-}
-
-// NewClusterMeta returns an initialized cluster meta store.
-func newClusterMeta() *clusterMeta {
-	return &clusterMeta{
-		APIPeers: make(map[string]string),
-	}
-}
-
-func (c *clusterMeta) AddrForPeer(addr string) string {
-	if api, ok := c.APIPeers[addr]; ok && api != "" {
-		return api
-	}
-
-	// Go through each entry, and see if any key resolves to addr.
-	for k, v := range c.APIPeers {
-		resv, err := net.ResolveTCPAddr("tcp", k)
-		if err != nil {
-			continue
-		}
-		if resv.String() == addr {
-			return v
-		}
-	}
-
-	return ""
-}
-
-// DBConfig represents the configuration of the underlying SQLite database.
-type DBConfig struct {
-	DSN    string // Any custom DSN
-	Memory bool   // Whether the database is in-memory only.
-}
-
-// NewDBConfig returns a new DB config instance.
-func NewDBConfig(dsn string, memory bool) *DBConfig {
-	return &DBConfig{DSN: dsn, Memory: memory}
-}
-
 // Store is a SQLite database, where all changes are made via Raft consensus.
 type Store struct {
 	raftDir string
 
-	mu sync.RWMutex // Sync access between queries and snapshots.
+	raft   *raft.Raft // The consensus mechanism.
+	ln     Listener
+	raftTn *raft.NetworkTransport
+	raftID string    // Node ID.
+	dbConf *DBConfig // SQLite database config.
+	dbPath string    // Path to underlying SQLite file, if not in-memory.
 
-	raft          *raft.Raft // The consensus mechanism.
-	raftTransport Transport
-	peerStore     raft.PeerStore
-	dbConf        *DBConfig // SQLite database config.
-	dbPath        string    // Path to underlying SQLite file, if not in-memory.
-	db            *sql.DB   // The underlying SQLite store.
-	joinRequired  bool      // Whether an explicit join is required.
+	connsMu sync.RWMutex
+	randSrc *rand.Rand
+	db      *sdb.DB                // The underlying SQLite database.
+	conns   map[uint64]*Connection // Database connections under management.
+	dbConn  *sdb.Conn              // Hidden connection to underlying SQLite database.
+
+	raftLog    raft.LogStore         // Persistent log store.
+	raftStable raft.StableStore      // Persistent k-v store.
+	boltStore  *raftboltdb.BoltStore // Physical store.
+
+	wg   sync.WaitGroup
+	done chan struct{}
 
 	metaMu sync.RWMutex
-	meta   *clusterMeta
+	meta   map[string]map[string]string
+
+	closedMu sync.Mutex
+	closed   bool // Has the store been closed?
+
+	restoreMu sync.RWMutex // Restore needs exclusive access to database.
 
 	logger *log.Logger
 
 	SnapshotThreshold uint64
+	SnapshotInterval  time.Duration
 	HeartbeatTimeout  time.Duration
 	ApplyTimeout      time.Duration
-	OpenTimeout       time.Duration
+
+	connPollPeriod time.Duration
 }
 
 // StoreConfig represents the configuration of the underlying Store.
 type StoreConfig struct {
-	DBConf    *DBConfig      // The DBConfig object for this Store.
-	Dir       string         // The working directory for raft.
-	Tn        Transport      // The underlying Transport for raft.
-	Logger    *log.Logger    // The logger to use to log stuff.
-	PeerStore raft.PeerStore // The PeerStore to use for raft.
+	DBConf *DBConfig   // The DBConfig object for this Store.
+	Dir    string      // The working directory for raft.
+	Tn     Transport   // The underlying Transport for raft.
+	ID     string      // Node ID.
+	Logger *log.Logger // The logger to use to log stuff.
 }
 
 // New returns a new Store.
-func New(c *StoreConfig) *Store {
+func New(ln Listener, c *StoreConfig) *Store {
 	logger := c.Logger
 	if logger == nil {
 		logger = log.New(os.Stderr, "[store] ", log.LstdFlags)
 	}
 
 	return &Store{
-		raftDir:       c.Dir,
-		raftTransport: c.Tn,
-		dbConf:        c.DBConf,
-		dbPath:        filepath.Join(c.Dir, sqliteFile),
-		meta:          newClusterMeta(),
-		logger:        logger,
-		peerStore:     c.PeerStore,
-		ApplyTimeout:  applyTimeout,
-		OpenTimeout:   openTimeout,
+		ln:             ln,
+		raftDir:        c.Dir,
+		raftID:         c.ID,
+		dbConf:         c.DBConf,
+		dbPath:         filepath.Join(c.Dir, sqliteFile),
+		randSrc:        rand.New(rand.NewSource(time.Now().UnixNano())),
+		conns:          make(map[uint64]*Connection),
+		done:           make(chan struct{}, 1),
+		meta:           make(map[string]map[string]string),
+		logger:         logger,
+		ApplyTimeout:   applyTimeout,
+		connPollPeriod: connectionPollPeriod,
 	}
 }
 
 // Open opens the store. If enableSingle is set, and there are no existing peers,
 // then this node becomes the first node, and therefore leader, of the cluster.
 func (s *Store) Open(enableSingle bool) error {
+	s.closedMu.Lock()
+	defer s.closedMu.Unlock()
+	if s.closed {
+		return ErrStoreInvalidState
+	}
+
+	s.logger.Printf("opening store with node ID %s", s.raftID)
+
+	s.logger.Printf("ensuring directory at %s exists", s.raftDir)
 	if err := os.MkdirAll(s.raftDir, 0755); err != nil {
 		return err
 	}
 
-	db, err := s.open()
+	// Create underlying database.
+	if err := s.createDatabase(); err != nil {
+		return err
+	}
+
+	// Get utility connection to database.
+	conn, err := s.db.Connect()
 	if err != nil {
 		return err
 	}
-	s.db = db
+	s.dbConn = conn
+	s.conns[defaultConnID] = NewConnection(s.dbConn, s, defaultConnID, 0, 0)
 
-	// Setup Raft communication.
-	transport := raft.NewNetworkTransport(s.raftTransport, 3, 10*time.Second, os.Stderr)
+	// Is this a brand new node?
+	newNode := !pathExists(filepath.Join(s.raftDir, "raft.db"))
 
-	// Create peer storage if necesssary.
-	if s.peerStore == nil {
-		s.peerStore = raft.NewJSONPeers(s.raftDir, transport)
-	}
+	// Create Raft-compatible network layer.
+	s.raftTn = raft.NewNetworkTransport(NewTransport(s.ln),
+		connectionPoolCount, connectionTimeout, nil)
 
 	// Get the Raft configuration for this store.
 	config := s.raftConfig()
-
-	// Check for any existing peers.
-	peers, err := s.peerStore.Peers()
-	if err != nil {
-		return err
-	}
-	s.joinRequired = len(peers) <= 1
-
-	// Allow the node to entry single-mode, potentially electing itself, if
-	// explicitly enabled and there is only 1 node in the cluster already.
-	if enableSingle && len(peers) <= 1 {
-		s.logger.Println("enabling single-node mode")
-		config.EnableSingleNode = true
-		config.DisableBootstrapAfterElect = false
-	}
+	config.LocalID = raft.ServerID(s.raftID)
+	config.Logger = log.New(os.Stderr, "[raft] ", log.LstdFlags)
 
 	// Create the snapshot store. This allows Raft to truncate the log.
 	snapshots, err := raft.NewFileSnapshotStore(s.raftDir, retainSnapshotCount, os.Stderr)
@@ -267,41 +287,175 @@ func (s *Store) Open(enableSingle bool) error {
 	}
 
 	// Create the log store and stable store.
-	logStore, err := raftboltdb.NewBoltStore(filepath.Join(s.raftDir, "raft.db"))
+	s.boltStore, err = raftboltdb.NewBoltStore(filepath.Join(s.raftDir, "raft.db"))
 	if err != nil {
 		return fmt.Errorf("new bolt store: %s", err)
 	}
+	s.raftStable = s.boltStore
+	s.raftLog, err = raft.NewLogCache(raftLogCacheSize, s.boltStore)
+	if err != nil {
+		return fmt.Errorf("new cached store: %s", err)
+	}
 
 	// Instantiate the Raft system.
-	ra, err := raft.NewRaft(config, s, logStore, logStore, snapshots, s.peerStore, transport)
+	ra, err := raft.NewRaft(config, s, s.raftLog, s.raftStable, snapshots, s.raftTn)
 	if err != nil {
 		return fmt.Errorf("new raft: %s", err)
 	}
+
+	if enableSingle && newNode {
+		s.logger.Printf("bootstrap needed")
+		configuration := raft.Configuration{
+			Servers: []raft.Server{
+				{
+					ID:      config.LocalID,
+					Address: s.raftTn.LocalAddr(),
+				},
+			},
+		}
+		ra.BootstrapCluster(configuration)
+	} else {
+		s.logger.Printf("no bootstrap needed")
+	}
+
 	s.raft = ra
 
-	if s.OpenTimeout != 0 {
-		// Wait until the initial logs are applied.
-		s.logger.Printf("waiting for up to %s for application of initial logs", s.OpenTimeout)
-		if err := s.WaitForAppliedIndex(s.raft.LastIndex(), s.OpenTimeout); err != nil {
-			return ErrOpenTimeout
-		}
-	} else {
-		s.logger.Println("not waiting for application of initial logs")
-	}
+	// Start connection monitoring
+	s.checkConnections()
 
 	return nil
 }
 
+// Connect returns a new connection to the database. Changes made to the database
+// through this connection are applied via the Raft consensus system. The Store
+// must have been opened first. Must be called on the leader or an error will
+// we returned.
+//
+// Any connection returned by this call are READ_COMMITTED isolated from all
+// other connections, including the connection built-in to the Store itself.
+func (s *Store) Connect(opt *ConnectionOptions) (*Connection, error) {
+	// Randomly-selected connection ID must be part of command so
+	// that all nodes use the same value as connection ID.
+	connID := func() uint64 {
+		s.connsMu.Lock()
+		defer s.connsMu.Unlock()
+		for {
+			// Make sure we get an unused ID.
+			id := s.randSrc.Uint64()
+			if _, ok := s.conns[id]; !ok {
+				s.conns[id] = nil
+				return id
+			}
+		}
+	}()
+
+	var it time.Duration
+	var tt time.Duration
+	if opt != nil {
+		it = opt.IdleTimeout
+		tt = opt.TxTimeout
+	}
+
+	d := &connectionSub{connID, it, tt}
+	cmd, err := newCommand(connect, d)
+	if err != nil {
+		return nil, err
+	}
+	b, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	f := s.raft.Apply(b, s.ApplyTimeout)
+	if e := f.(raft.Future); e.Error() != nil {
+		if e.Error() == raft.ErrNotLeader {
+			return nil, ErrNotLeader
+		}
+		return nil, e.Error()
+	}
+
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	stats.Add(numConnects, 1)
+	return s.conns[connID], nil
+}
+
+// Execute executes queries that return no rows, but do modify the database.
+// Changes made to the database through this call are applied via the Raft
+// consensus system. The Store must have been opened first. Must be called
+// on the leader or an error will we returned. The changes are made using
+// the database connection built-in to the Store.
+func (s *Store) Execute(ex *ExecuteRequest) (*ExecuteResponse, error) {
+	return s.execute(nil, ex)
+}
+
+// ExecuteOrAbort executes the requests, but aborts any active transaction
+// on the underlying database in the case of any error. Any changes are made
+// using the database connection built-in to the Store.
+func (s *Store) ExecuteOrAbort(ex *ExecuteRequest) (resp *ExecuteResponse, retErr error) {
+	return s.executeOrAbort(nil, ex)
+}
+
+// Query executes queries that return rows, and do not modify the database.
+// The queries are made using the database connection built-in to the Store.
+// Depending on the read consistency requested, it may or may not need to be
+// called on the leader.
+func (s *Store) Query(qr *QueryRequest) (*QueryResponse, error) {
+	return s.query(nil, qr)
+}
+
 // Close closes the store. If wait is true, waits for a graceful shutdown.
+// Once closed, a Store may not be re-opened.
 func (s *Store) Close(wait bool) error {
-	if err := s.db.Close(); err != nil {
+	s.closedMu.Lock()
+	defer s.closedMu.Unlock()
+	if s.closed {
+		return nil
+	}
+	defer func() {
+		s.closed = true
+	}()
+
+	close(s.done)
+	s.wg.Wait()
+
+	// XXX CLOSE OTHER CONNECTIONS
+	if err := s.dbConn.Close(); err != nil {
 		return err
 	}
-	f := s.raft.Shutdown()
-	if wait {
-		if e := f.(raft.Future); e.Error() != nil {
-			return e.Error()
+	s.dbConn = nil
+	s.db = nil
+
+	if s.raft != nil {
+		f := s.raft.Shutdown()
+		if wait {
+			if e := f.(raft.Future); e.Error() != nil {
+				return e.Error()
+			}
 		}
+		s.raft = nil
+	}
+
+	if s.boltStore != nil {
+		if err := s.boltStore.Close(); err != nil {
+			return err
+		}
+		s.boltStore = nil
+	}
+	s.raftLog = nil
+	s.raftStable = nil
+	return nil
+}
+
+// WaitForApplied waits for all Raft log entries to to be applied to the
+// underlying database.
+func (s *Store) WaitForApplied(timeout time.Duration) error {
+	if timeout == 0 {
+		return nil
+	}
+	s.logger.Printf("waiting for up to %s for application of initial logs", timeout)
+	if err := s.WaitForAppliedIndex(s.raft.LastIndex(), timeout); err != nil {
+		return ErrOpenTimeout
 	}
 	return nil
 }
@@ -328,48 +482,71 @@ func (s *Store) State() ClusterState {
 	}
 }
 
-// JoinRequired returns whether the node needs to join a cluster after being opened.
-func (s *Store) JoinRequired() bool {
-	return s.joinRequired
-}
-
 // Path returns the path to the store's storage directory.
 func (s *Store) Path() string {
 	return s.raftDir
 }
 
 // Addr returns the address of the store.
-func (s *Store) Addr() net.Addr {
-	return s.raftTransport.Addr()
+func (s *Store) Addr() string {
+	return string(s.raftTn.LocalAddr())
 }
 
-// Leader returns the current leader. Returns a blank string if there is
-// no leader.
-func (s *Store) Leader() string {
-	return s.raft.Leader()
+// ID returns the Raft ID of the store.
+func (s *Store) ID() string {
+	return s.raftID
 }
 
-// Peer returns the API address for the given addr. If there is no peer
-// for the address, it returns the empty string.
-func (s *Store) Peer(addr string) string {
-	return s.meta.AddrForPeer(addr)
+// Connection returns the connection for the given ID.
+func (s *Store) Connection(id uint64) (*Connection, bool) {
+	s.connsMu.RLock()
+	defer s.connsMu.RUnlock()
+	c, ok := s.conns[id]
+	return c, ok
 }
 
-// APIPeers return the map of Raft addresses to API addresses.
-func (s *Store) APIPeers() (map[string]string, error) {
-	s.metaMu.RLock()
-	defer s.metaMu.RUnlock()
+// LeaderAddr returns the Raft address of the current leader. Returns a
+// blank string if there is no leader.
+func (s *Store) LeaderAddr() string {
+	return string(s.raft.Leader())
+}
 
-	peers := make(map[string]string, len(s.meta.APIPeers))
-	for k, v := range s.meta.APIPeers {
-		peers[k] = v
+// LeaderID returns the node ID of the Raft leader. Returns a
+// blank string if there is no leader, or an error.
+func (s *Store) LeaderID() (string, error) {
+	addr := s.LeaderAddr()
+	configFuture := s.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		s.logger.Printf("failed to get raft configuration: %v", err)
+		return "", err
 	}
-	return peers, nil
+
+	for _, srv := range configFuture.Configuration().Servers {
+		if srv.Address == raft.ServerAddress(addr) {
+			return string(srv.ID), nil
+		}
+	}
+	return "", nil
 }
 
-// Nodes returns the list of current peers.
-func (s *Store) Nodes() ([]string, error) {
-	return s.peerStore.Peers()
+// Nodes returns the slice of nodes in the cluster, sorted by ID ascending.
+func (s *Store) Nodes() ([]*Server, error) {
+	f := s.raft.GetConfiguration()
+	if f.Error() != nil {
+		return nil, f.Error()
+	}
+
+	rs := f.Configuration().Servers
+	servers := make([]*Server, len(rs))
+	for i := range rs {
+		servers[i] = &Server{
+			ID:   string(rs[i].ID),
+			Addr: string(rs[i].Address),
+		}
+	}
+
+	sort.Sort(Servers(servers))
+	return servers, nil
 }
 
 // WaitForLeader blocks until a leader is detected, or the timeout expires.
@@ -382,7 +559,7 @@ func (s *Store) WaitForLeader(timeout time.Duration) (string, error) {
 	for {
 		select {
 		case <-tck.C:
-			l := s.Leader()
+			l := s.LeaderAddr()
 			if l != "" {
 				return l, nil
 			}
@@ -414,15 +591,15 @@ func (s *Store) WaitForAppliedIndex(idx uint64, timeout time.Duration) error {
 
 // Stats returns stats for the store.
 func (s *Store) Stats() (map[string]interface{}, error) {
-	fkEnabled, err := s.db.FKConstraints()
+	fkEnabled, err := s.dbConn.FKConstraints()
 	if err != nil {
 		return nil, err
 	}
 
 	dbStatus := map[string]interface{}{
-		"dns":            s.dbConf.DSN,
+		"dsn":            s.dbConf.DSN,
 		"fk_constraints": enabledFromBool(fkEnabled),
-		"version":        sql.DBVersion,
+		"version":        sdb.DBVersion,
 	}
 	if !s.dbConf.Memory {
 		dbStatus["path"] = s.dbPath
@@ -435,45 +612,263 @@ func (s *Store) Stats() (map[string]interface{}, error) {
 		dbStatus["path"] = ":memory:"
 	}
 
-	s.metaMu.RLock()
-	defer s.metaMu.RUnlock()
-	peers, err := s.peerStore.Peers()
+	nodes, err := s.Nodes()
 	if err != nil {
 		return nil, err
 	}
+	leaderID, err := s.LeaderID()
+	if err != nil {
+		return nil, err
+	}
+
 	status := map[string]interface{}{
-		"raft":               s.raft.Stats(),
-		"addr":               s.Addr().String(),
-		"leader":             s.Leader(),
+		"node_id": s.raftID,
+		"raft":    s.raft.Stats(),
+		"addr":    s.Addr(),
+		"leader": map[string]string{
+			"node_id": leaderID,
+			"addr":    s.LeaderAddr(),
+		},
 		"apply_timeout":      s.ApplyTimeout.String(),
-		"open_timeout":       s.OpenTimeout.String(),
 		"heartbeat_timeout":  s.HeartbeatTimeout.String(),
 		"snapshot_threshold": s.SnapshotThreshold,
-		"meta":               s.meta,
-		"peers":              peers,
+		"conn_poll_period":   s.connPollPeriod.String(),
+		"metadata":           s.meta,
+		"nodes":              nodes,
 		"dir":                s.raftDir,
 		"sqlite3":            dbStatus,
 		"db_conf":            s.dbConf,
 	}
+
+	// Add connections status
+	if err := func() error {
+		s.connsMu.RLock()
+		defer s.connsMu.RUnlock()
+		if len(s.conns) > 1 {
+			conns := make([]interface{}, len(s.conns)-1)
+			ci := 0
+			for id, c := range s.conns {
+				if id == defaultConnID {
+					continue
+				}
+				stats, err := c.Stats()
+				if err != nil {
+					return err
+				}
+				conns[ci] = stats
+				ci++
+			}
+			status["connections"] = conns
+		}
+		return nil
+	}(); err != nil {
+		return nil, err
+	}
+
 	return status, nil
 }
 
-// Execute executes queries that return no rows, but do modify the database.
-func (s *Store) Execute(ex *ExecuteRequest) ([]*sql.Result, error) {
-	if s.raft.State() != raft.Leader {
-		return nil, ErrNotLeader
+// Backup writes a snapshot of the underlying database to dst
+//
+// If leader is true, this operation is performed with a read consistency
+// level equivalent to "weak". Otherwise no guarantees are made about the
+// read consistency level.
+func (s *Store) Backup(leader bool, fmt BackupFormat, dst io.Writer) error {
+	s.restoreMu.RLock()
+	defer s.restoreMu.RUnlock()
+
+	if leader && s.raft.State() != raft.Leader {
+		return ErrNotLeader
 	}
 
+	var err error
+	if fmt == BackupBinary {
+		err = s.database(leader, dst)
+		if err != nil {
+			return err
+		}
+	} else if fmt == BackupSQL {
+		if err := s.dbConn.Dump(dst); err != nil {
+			return err
+		}
+	} else {
+		return ErrInvalidBackupFormat
+	}
+	stats.Add(numBackups, 1)
+	return nil
+}
+
+// Join joins a node, identified by id and located at addr, to this store.
+// The node must be ready to respond to Raft communications at that address.
+func (s *Store) Join(id, addr string, metadata map[string]string) error {
+	s.logger.Printf("received request to join node at %s", addr)
+	if s.raft.State() != raft.Leader {
+		return ErrNotLeader
+	}
+
+	configFuture := s.raft.GetConfiguration()
+	if err := configFuture.Error(); err != nil {
+		s.logger.Printf("failed to get raft configuration: %v", err)
+		return err
+	}
+
+	for _, srv := range configFuture.Configuration().Servers {
+		// If a node already exists with either the joining node's ID or address,
+		// that node may need to be removed from the config first.
+		if srv.ID == raft.ServerID(id) || srv.Address == raft.ServerAddress(addr) {
+			// However if *both* the ID and the address are the same, the no
+			// join is actually needed.
+			if srv.Address == raft.ServerAddress(addr) && srv.ID == raft.ServerID(id) {
+				s.logger.Printf("node %s at %s already member of cluster, ignoring join request",
+					id, addr)
+				return nil
+			}
+			if err := s.remove(id); err != nil {
+				s.logger.Printf("failed to remove node: %v", err)
+				return err
+			}
+		}
+	}
+
+	f := s.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, 0)
+	if e := f.(raft.Future); e.Error() != nil {
+		if e.Error() == raft.ErrNotLeader {
+			return ErrNotLeader
+		}
+		return e.Error()
+	}
+
+	if err := s.setMetadata(id, metadata); err != nil {
+		return err
+	}
+
+	s.logger.Printf("node at %s joined successfully", addr)
+	return nil
+}
+
+// Remove removes a node from the store, specified by ID.
+func (s *Store) Remove(id string) error {
+	s.logger.Printf("received request to remove node %s", id)
+	if err := s.remove(id); err != nil {
+		s.logger.Printf("failed to remove node %s: %s", id, err.Error())
+		return err
+	}
+
+	s.logger.Printf("node %s removed successfully", id)
+	return nil
+}
+
+// Metadata returns the value for a given key, for a given node ID.
+func (s *Store) Metadata(id, key string) string {
+	s.metaMu.RLock()
+	defer s.metaMu.RUnlock()
+
+	if _, ok := s.meta[id]; !ok {
+		return ""
+	}
+	v, ok := s.meta[id][key]
+	if ok {
+		return v
+	}
+	return ""
+}
+
+// SetMetadata adds the metadata md to any existing metadata for
+// this node.
+func (s *Store) SetMetadata(md map[string]string) error {
+	return s.setMetadata(s.raftID, md)
+}
+
+// setMetadata adds the metadata md to any existing metadata for
+// the given node ID.
+func (s *Store) setMetadata(id string, md map[string]string) error {
+	// Check local data first.
+	if func() bool {
+		s.metaMu.RLock()
+		defer s.metaMu.RUnlock()
+		if _, ok := s.meta[id]; ok {
+			for k, v := range md {
+				if s.meta[id][k] != v {
+					return false
+				}
+			}
+			return true
+		}
+		return false
+	}() {
+		// Local data is same as data being pushed in,
+		// nothing to do.
+		return nil
+	}
+
+	c, err := newMetadataSetCommand(id, md)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return err
+	}
+	f := s.raft.Apply(b, s.ApplyTimeout)
+	if e := f.(raft.Future); e.Error() != nil {
+		if e.Error() == raft.ErrNotLeader {
+			return ErrNotLeader
+		}
+		return e.Error()
+	}
+
+	return f.Response().(*fsmGenericResponse).error
+}
+
+// disconnect removes a connection to the database, a connection
+// which was previously established via Raft consensus.
+func (s *Store) disconnect(c *Connection) error {
+	d := &connectionSub{
+		ConnID: c.ID,
+	}
+	cmd, err := newCommand(disconnect, d)
+	if err != nil {
+		return err
+	}
+	b, err := json.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+
+	f := s.raft.Apply(b, s.ApplyTimeout)
+	if e := f.(raft.Future); e.Error() != nil {
+		if e.Error() == raft.ErrNotLeader {
+			return ErrNotLeader
+		}
+		return e.Error()
+	}
+	stats.Add(numDisconnects, 1)
+	return f.Response().(*fsmGenericResponse).error
+}
+
+// Execute executes queries that return no rows, but do modify the database. If connection
+// is nil then the utility connection is used.
+func (s *Store) execute(c *Connection, ex *ExecuteRequest) (*ExecuteResponse, error) {
+	if c == nil {
+		s.connsMu.RLock()
+		c = s.conns[defaultConnID]
+		s.connsMu.RUnlock()
+	}
+	c.SetLastUsedNow()
+
+	start := time.Now()
+
 	d := &databaseSub{
-		Tx:      ex.Tx,
+		ConnID:  c.ID,
+		Atomic:  ex.Atomic,
 		Queries: ex.Queries,
 		Timings: ex.Timings,
 	}
-	c, err := newCommand(execute, d)
+	cmd, err := newCommand(execute, d)
 	if err != nil {
 		return nil, err
 	}
-	b, err := json.Marshal(c)
+	b, err := json.Marshal(cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -486,55 +881,73 @@ func (s *Store) Execute(ex *ExecuteRequest) ([]*sql.Result, error) {
 		return nil, e.Error()
 	}
 
-	r := f.Response().(*fsmExecuteResponse)
-	return r.results, r.error
+	switch r := f.Response().(type) {
+	case *fsmExecuteResponse:
+		return &ExecuteResponse{
+			Results: r.results,
+			Time:    time.Since(start).Seconds(),
+			Raft:    RaftResponse{f.Index(), s.raftID},
+		}, r.error
+	case *fsmGenericResponse:
+		return nil, r.error
+	default:
+		panic("unsupported type")
+	}
 }
 
-// Backup return a snapshot of the underlying database.
-//
-// If leader is true, this operation is performed with a read consistency
-// level equivalent to "weak". Otherwise no guarantees are made about the
-// read consistency level.
-func (s *Store) Backup(leader bool) ([]byte, error) {
-	if leader && s.raft.State() != raft.Leader {
-		return nil, ErrNotLeader
+func (s *Store) executeOrAbort(c *Connection, ex *ExecuteRequest) (resp *ExecuteResponse, retErr error) {
+	if c == nil {
+		s.connsMu.RLock()
+		c = s.conns[defaultConnID]
+		s.connsMu.RUnlock()
 	}
 
-	f, err := ioutil.TempFile("", "rqlite-bak-")
-	if err != nil {
-		return nil, err
-	}
-	f.Close()
-	defer os.Remove(f.Name())
-
-	if err := s.db.Backup(f.Name()); err != nil {
-		return nil, err
-	}
-
-	b, err := ioutil.ReadFile(f.Name())
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+	defer func() {
+		var errored bool
+		if resp != nil {
+			for i := range resp.Results {
+				if resp.Results[i].Error != "" {
+					errored = true
+					break
+				}
+			}
+		}
+		if retErr != nil || errored {
+			if err := c.AbortTransaction(); err != nil {
+				c.logger.Printf("WARNING: failed to abort transaction on %s: %s",
+					c, err.Error())
+			}
+		}
+	}()
+	return c.store.execute(c, ex)
 }
 
-// Query executes queries that return rows, and do not modify the database.
-func (s *Store) Query(qr *QueryRequest) ([]*sql.Rows, error) {
-	// Allow concurrent queries.
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// Query executes queries that return rows, and do not modify the database. If
+// connection is nil, then the utility connection is used.
+func (s *Store) query(c *Connection, qr *QueryRequest) (*QueryResponse, error) {
+	if c == nil {
+		s.connsMu.RLock()
+		c = s.conns[defaultConnID]
+		s.connsMu.RUnlock()
+	}
+	c.SetLastUsedNow()
+
+	s.restoreMu.RLock()
+	defer s.restoreMu.RUnlock()
+	start := time.Now()
 
 	if qr.Lvl == Strong {
 		d := &databaseSub{
-			Tx:      qr.Tx,
+			ConnID:  c.ID,
+			Atomic:  qr.Atomic,
 			Queries: qr.Queries,
 			Timings: qr.Timings,
 		}
-		c, err := newCommand(query, d)
+		cmd, err := newCommand(query, d)
 		if err != nil {
 			return nil, err
 		}
-		b, err := json.Marshal(c)
+		b, err := json.Marshal(cmd)
 		if err != nil {
 			return nil, err
 		}
@@ -547,21 +960,71 @@ func (s *Store) Query(qr *QueryRequest) ([]*sql.Rows, error) {
 			return nil, e.Error()
 		}
 
-		r := f.Response().(*fsmQueryResponse)
-		return r.rows, r.error
+		switch r := f.Response().(type) {
+		case *fsmQueryResponse:
+			return &QueryResponse{
+				Rows: r.rows,
+				Time: time.Since(start).Seconds(),
+				Raft: &RaftResponse{f.Index(), s.raftID},
+			}, r.error
+		case *fsmGenericResponse:
+			return nil, r.error
+		default:
+			panic("unsupported type")
+		}
 	}
 
 	if qr.Lvl == Weak && s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}
 
-	r, err := s.db.Query(qr.Queries, qr.Tx, qr.Timings)
-	return r, err
+	r, err := c.db.Query(qr.Queries, qr.Atomic, qr.Timings)
+	return &QueryResponse{
+		Rows: r,
+		Time: time.Since(start).Seconds(),
+	}, err
 }
 
-// UpdateAPIPeers updates the cluster-wide peer information.
-func (s *Store) UpdateAPIPeers(peers map[string]string) error {
-	c, err := newCommand(peer, peers)
+// createDatabase creates the the in-memory or file-based database.
+func (s *Store) createDatabase() error {
+	var db *sdb.DB
+	var err error
+	if !s.dbConf.Memory {
+		// as it will be rebuilt from (possibly) a snapshot and committed log entries.
+		if err := os.Remove(s.dbPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		db, err = sdb.New(s.dbPath, s.dbConf.DSN, false)
+		if err != nil {
+			return err
+		}
+		s.logger.Println("SQLite database opened at", s.dbPath)
+	} else {
+		db, err = sdb.New(s.dbPath, s.dbConf.DSN, true)
+		if err != nil {
+			return err
+		}
+		s.logger.Println("SQLite in-memory database opened")
+	}
+	s.db = db
+	return nil
+}
+
+// remove removes the node, with the given ID, from the cluster.
+func (s *Store) remove(id string) error {
+	if s.raft.State() != raft.Leader {
+		return ErrNotLeader
+	}
+
+	f := s.raft.RemoveServer(raft.ServerID(id), 0, 0)
+	if f.Error() != nil {
+		if f.Error() == raft.ErrNotLeader {
+			return ErrNotLeader
+		}
+		return f.Error()
+	}
+
+	c, err := newCommand(metadataDelete, id)
 	if err != nil {
 		return err
 	}
@@ -569,64 +1032,15 @@ func (s *Store) UpdateAPIPeers(peers map[string]string) error {
 	if err != nil {
 		return err
 	}
-
-	f := s.raft.Apply(b, s.ApplyTimeout)
-	return f.Error()
-}
-
-// Join joins a node, located at addr, to this store. The node must be ready to
-// respond to Raft communications at that address.
-func (s *Store) Join(addr string) error {
-	s.logger.Printf("received request to join node at %s", addr)
-	if s.raft.State() != raft.Leader {
-		return ErrNotLeader
-	}
-
-	f := s.raft.AddPeer(addr)
+	f = s.raft.Apply(b, s.ApplyTimeout)
 	if e := f.(raft.Future); e.Error() != nil {
 		if e.Error() == raft.ErrNotLeader {
 			return ErrNotLeader
 		}
 		e.Error()
 	}
-	s.logger.Printf("node at %s joined successfully", addr)
+
 	return nil
-}
-
-// Remove removes a node from the store, specified by addr.
-func (s *Store) Remove(addr string) error {
-	s.logger.Printf("received request to remove node %s", addr)
-
-	f := s.raft.RemovePeer(addr)
-	if f.Error() != nil {
-		return f.Error()
-	}
-	s.logger.Printf("node %s removed successfully", addr)
-	return nil
-}
-
-// open opens the the in-memory or file-based database.
-func (s *Store) open() (*sql.DB, error) {
-	var db *sql.DB
-	var err error
-	if !s.dbConf.Memory {
-		// as it will be rebuilt from (possibly) a snapshot and committed log entries.
-		if err := os.Remove(s.dbPath); err != nil && !os.IsNotExist(err) {
-			return nil, err
-		}
-		db, err = sql.OpenWithDSN(s.dbPath, s.dbConf.DSN)
-		if err != nil {
-			return nil, err
-		}
-		s.logger.Println("SQLite database opened at", s.dbPath)
-	} else {
-		db, err = sql.OpenInMemoryWithDSN(s.dbConf.DSN)
-		if err != nil {
-			return nil, err
-		}
-		s.logger.Println("SQLite in-memory database opened")
-	}
-	return db, nil
 }
 
 // raftConfig returns a new Raft config for the store.
@@ -635,19 +1049,73 @@ func (s *Store) raftConfig() *raft.Config {
 	if s.SnapshotThreshold != 0 {
 		config.SnapshotThreshold = s.SnapshotThreshold
 	}
+	if s.SnapshotInterval != 0 {
+		config.SnapshotInterval = s.SnapshotInterval
+	}
 	if s.HeartbeatTimeout != 0 {
 		config.HeartbeatTimeout = s.HeartbeatTimeout
 	}
 	return config
 }
 
+// checkConnections periodically checks which connections should
+// close due to timeouts.
+func (s *Store) checkConnections() {
+	s.wg.Add(1)
+	ticker := time.NewTicker(s.connPollPeriod)
+	go func() {
+		defer s.wg.Done()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.done:
+				return
+			case <-ticker.C:
+				// This is not a 100% correct check, but is right almost all
+				// the time, and saves the node from most unneeded network
+				// access. Read https://github.com/rqlite/rqlite/issues/5
+				if !s.IsLeader() {
+					continue
+				}
+
+				var conns []*Connection
+				s.connsMu.RLock()
+				for _, c := range s.conns {
+					// Sometimes IDs are in the slice without a connection, if a
+					// connection is in process of being formed via consensus.
+					if c == nil || c.ID == defaultConnID {
+						continue
+					}
+					if c.IdleTimedOut() || c.TxTimedOut() {
+						conns = append(conns, c)
+					}
+				}
+				s.connsMu.RUnlock()
+
+				for _, c := range conns {
+					if err := c.Close(); err != nil {
+						if err == ErrNotLeader {
+							// Not an issue, the actual leader will close it.
+							continue
+						}
+						s.logger.Printf("%s failed to close: %s", c, err.Error())
+					}
+					s.logger.Printf("%s closed due to timeout", c)
+					// Only increment stat here to make testing easier.
+					stats.Add(numConnTimeouts, 1)
+				}
+			}
+		}
+	}()
+}
+
 type fsmExecuteResponse struct {
-	results []*sql.Result
+	results []*sdb.Result
 	error   error
 }
 
 type fsmQueryResponse struct {
-	rows  []*sql.Rows
+	rows  []*sdb.Rows
 	error error
 }
 
@@ -657,6 +1125,9 @@ type fsmGenericResponse struct {
 
 // Apply applies a Raft log entry to the database.
 func (s *Store) Apply(l *raft.Log) interface{} {
+	s.restoreMu.RLock()
+	defer s.restoreMu.RUnlock()
+
 	var c command
 	if err := json.Unmarshal(l.Data, &c); err != nil {
 		panic(fmt.Sprintf("failed to unmarshal cluster command: %s", err.Error()))
@@ -668,90 +1139,185 @@ func (s *Store) Apply(l *raft.Log) interface{} {
 		if err := json.Unmarshal(c.Sub, &d); err != nil {
 			return &fsmGenericResponse{error: err}
 		}
+
+		s.connsMu.RLock()
+		conn, ok := s.conns[d.ConnID]
+		s.connsMu.RUnlock()
+		if !ok {
+			return &fsmGenericResponse{error: ErrConnectionDoesNotExist}
+		}
+
 		if c.Typ == execute {
-			r, err := s.db.Execute(d.Queries, d.Tx, d.Timings)
+			txChange := NewTxStateChange(conn)
+			r, err := conn.db.Execute(d.Queries, d.Atomic, d.Timings)
+			txChange.CheckAndSet()
 			return &fsmExecuteResponse{results: r, error: err}
 		}
-		r, err := s.db.Query(d.Queries, d.Tx, d.Timings)
+		r, err := conn.db.Query(d.Queries, d.Atomic, d.Timings)
 		return &fsmQueryResponse{rows: r, error: err}
-	case peer:
-		var d peersSub
+	case metadataSet:
+		var d metadataSetSub
 		if err := json.Unmarshal(c.Sub, &d); err != nil {
 			return &fsmGenericResponse{error: err}
 		}
 		func() {
 			s.metaMu.Lock()
 			defer s.metaMu.Unlock()
-			for k, v := range d {
-				s.meta.APIPeers[k] = v
+			if _, ok := s.meta[d.RaftID]; !ok {
+				s.meta[d.RaftID] = make(map[string]string)
+			}
+			for k, v := range d.Data {
+				s.meta[d.RaftID][k] = v
 			}
 		}()
 		return &fsmGenericResponse{}
+	case metadataDelete:
+		var d string
+		if err := json.Unmarshal(c.Sub, &d); err != nil {
+			return &fsmGenericResponse{error: err}
+		}
+		func() {
+			s.metaMu.Lock()
+			defer s.metaMu.Unlock()
+			delete(s.meta, d)
+		}()
+		return &fsmGenericResponse{}
+	case connect:
+		var d connectionSub
+		if err := json.Unmarshal(c.Sub, &d); err != nil {
+			return &fsmGenericResponse{error: err}
+		}
+
+		conn, err := s.db.Connect()
+		if err != nil {
+			return &fsmGenericResponse{error: err}
+		}
+		s.connsMu.Lock()
+		s.conns[d.ConnID] = NewConnection(conn, s, d.ConnID, d.IdleTimeout, d.TxTimeout)
+		s.connsMu.Unlock()
+		return d.ConnID
+	case disconnect:
+		var d connectionSub
+		if err := json.Unmarshal(c.Sub, &d); err != nil {
+			return &fsmGenericResponse{error: err}
+		}
+
+		if d.ConnID == defaultConnID {
+			return &fsmGenericResponse{error: ErrDefaultConnection}
+		}
+
+		return func() interface{} {
+			s.connsMu.Lock()
+			defer s.connsMu.Unlock()
+			delete(s.conns, d.ConnID)
+			return &fsmGenericResponse{}
+		}()
+
 	default:
 		return &fsmGenericResponse{error: fmt.Errorf("unknown command: %v", c.Typ)}
 	}
 }
 
-// Database returns a copy of the underlying database. The caller should
-// ensure that no transaction is taking place during this call, or an error may
-// be returned. If leader is true, this operation is performed with a read
-// consistency level equivalent to "weak". Otherwise no guarantees are made
-// about the read consistency level.
-//
-// http://sqlite.org/howtocorrupt.html states it is safe to do this
-// as long as no transaction is in progress.
-func (s *Store) Database(leader bool) ([]byte, error) {
+// Database copies contents of the underlying SQLite file to dst
+func (s *Store) database(leader bool, dst io.Writer) error {
 	if leader && s.raft.State() != raft.Leader {
-		return nil, ErrNotLeader
+		return ErrNotLeader
 	}
-
-	// Ensure only one snapshot can take place at once, and block all queries.
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	f, err := ioutil.TempFile("", "rqlilte-snap-")
 	if err != nil {
-		return nil, err
+		return err
 	}
-	f.Close()
-	defer os.Remove(f.Name())
-
-	if err := s.db.Backup(f.Name()); err != nil {
-		return nil, err
+	if err := f.Close(); err != nil {
+		return err
+	}
+	os.Remove(f.Name())
+	db, err := sdb.New(f.Name(), "", false)
+	if err != nil {
+		return err
+	}
+	conn, err := db.Connect()
+	if err != nil {
+		return err
 	}
 
-	return ioutil.ReadFile(f.Name())
+	if err := s.dbConn.Backup(conn); err != nil {
+		return err
+	}
+	if err := conn.Close(); err != nil {
+		return err
+	}
+
+	of, err := os.Open(f.Name())
+	if err != nil {
+		return err
+	}
+	defer of.Close()
+
+	_, err = io.Copy(dst, of)
+	return err
 }
 
-// Snapshot returns a snapshot of the database. The caller must ensure that
-// no transaction is taking place during this call. Hashicorp Raft guarantees
-// that this function will not be called concurrently with Apply.
-//
-// http://sqlite.org/howtocorrupt.html states it is safe to do this
-// as long as no transaction is in progress.
+// Snapshot returns a snapshot of the store. The caller must ensure that
+// no Raft transaction is taking place during this call. Hashicorp Raft
+// guarantees that this function will not be called concurrently with Apply.
 func (s *Store) Snapshot() (raft.FSMSnapshot, error) {
+	s.restoreMu.RLock()
+	defer s.restoreMu.RUnlock()
+
+	// Snapshots are not permitted while any connection has a transaction
+	// in progress, because it's not possible (not without a lot of extra
+	// code anyway) to capture the state of a connection during a transaction
+	// on that connection. Since only during Apply() can a connection change
+	// its transaction state, and Apply() is never called concurrently with
+	// this call, it's safe to check transaction state here across all connections.
+	if err := func() error {
+		s.connsMu.Lock()
+		defer s.connsMu.Unlock()
+		for _, c := range s.conns {
+			if c.TransactionActive() {
+				stats.Add(numSnaphotsBlocked, 1)
+				return ErrTransactionActive
+			}
+		}
+		return nil
+	}(); err != nil {
+		return nil, err
+	}
+
+	// Copy the database.
 	fsm := &fsmSnapshot{}
+	var buf bytes.Buffer
 	var err error
-	fsm.database, err = s.Database(false)
+	err = s.database(false, &buf)
 	if err != nil {
 		s.logger.Printf("failed to read database for snapshot: %s", err.Error())
 		return nil, err
 	}
+	fsm.database = buf.Bytes()
 
+	// Copy the node metadata.
 	fsm.meta, err = json.Marshal(s.meta)
 	if err != nil {
 		s.logger.Printf("failed to encode meta for snapshot: %s", err.Error())
 		return nil, err
 	}
 
+	// Copy the active connections.
+	fsm.connections, err = json.Marshal(s.conns)
+	if err != nil {
+		s.logger.Printf("failed to encode connections for snapshot: %s", err.Error())
+		return nil, err
+	}
+	stats.Add(numSnaphots, 1)
+
 	return fsm, nil
 }
 
 // Restore restores the node to a previous state.
 func (s *Store) Restore(rc io.ReadCloser) error {
-	if err := s.db.Close(); err != nil {
-		return err
-	}
+	s.restoreMu.Lock()
+	defer s.restoreMu.Unlock()
 
 	// Get size of database.
 	var sz uint64
@@ -765,51 +1331,79 @@ func (s *Store) Restore(rc io.ReadCloser) error {
 		return err
 	}
 
-	var db *sql.DB
-	var err error
-	if !s.dbConf.Memory {
-		// Write snapshot over any existing database file.
-		if err := ioutil.WriteFile(s.dbPath, database, 0660); err != nil {
-			return err
-		}
-
-		// Re-open it.
-		db, err = sql.OpenWithDSN(s.dbPath, s.dbConf.DSN)
-		if err != nil {
-			return err
-		}
-	} else {
-		// In memory. Copy to temporary file, and then load memory from file.
-		f, err := ioutil.TempFile("", "rqlilte-snap-")
-		if err != nil {
-			return err
-		}
-		f.Close()
-		defer os.Remove(f.Name())
-
-		if err := ioutil.WriteFile(f.Name(), database, 0660); err != nil {
-			return err
-		}
-
-		// Load an in-memory database from the snapshot now on disk.
-		db, err = sql.LoadInMemoryWithDSN(f.Name(), s.dbConf.DSN)
-		if err != nil {
-			return err
-		}
+	// Create temp file and write incoming database to there.
+	temp, err := tempfile()
+	if err != nil {
+		return err
 	}
-	s.db = db
+	defer os.Remove(temp.Name())
+	defer temp.Close()
 
-	// Read remaining bytes, and set to cluster meta.
-	b, err := ioutil.ReadAll(rc)
+	if _, err := temp.Write(database); err != nil {
+		return err
+	}
+
+	// Create new database from file, connect, and load
+	// existing database from that.
+	db, err := sdb.New(temp.Name(), "", false)
+	if err != nil {
+		return err
+	}
+	conn, err := db.Connect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := s.dbConn.Load(conn); err != nil {
+		return err
+	}
+
+	// Get size of meta, read those bytes, and set to meta.
+	if err := binary.Read(rc, binary.LittleEndian, &sz); err != nil {
+		return err
+	}
+	meta := make([]byte, sz)
+	if _, err := io.ReadFull(rc, meta); err != nil {
+		return err
+	}
+	err = func() error {
+		s.metaMu.Lock()
+		defer s.metaMu.Unlock()
+		return json.Unmarshal(meta, &s.meta)
+	}()
 	if err != nil {
 		return err
 	}
 
-	return func() error {
-		s.metaMu.Lock()
-		defer s.metaMu.Unlock()
-		return json.Unmarshal(b, &s.meta)
+	// Get size of connections, read those bytes, and set to connections.
+	if err := binary.Read(rc, binary.LittleEndian, &sz); err != nil {
+		return err
+	}
+	conns := make([]byte, sz)
+	if _, err := io.ReadFull(rc, conns); err != nil {
+		return err
+	}
+	err = func() error {
+		s.connsMu.Lock()
+		defer s.connsMu.Unlock()
+		if err := json.Unmarshal(conns, &s.conns); err != nil {
+			return err
+		}
+		for _, c := range s.conns {
+			dbConn, err := s.db.Connect()
+			if err != nil {
+				return err
+			}
+			c.Restore(dbConn, s)
+		}
+		return nil
 	}()
+	if err != nil {
+		return err
+	}
+
+	stats.Add(numRestores, 1)
+	return nil
 }
 
 // RegisterObserver registers an observer of Raft events
@@ -823,39 +1417,40 @@ func (s *Store) DeregisterObserver(o *raft.Observer) {
 }
 
 type fsmSnapshot struct {
-	database []byte
-	meta     []byte
+	database    []byte
+	meta        []byte
+	connections []byte
 }
 
 // Persist writes the snapshot to the given sink.
 func (f *fsmSnapshot) Persist(sink raft.SnapshotSink) error {
-	err := func() error {
-		// Start by writing size of database.
-		b := new(bytes.Buffer)
-		sz := uint64(len(f.database))
-		err := binary.Write(b, binary.LittleEndian, sz)
+	// sizeWriter writes the size of given byte slize to the
+	// raft sink, followed by the byte slice itself.
+	sizeWriter := func(s raft.SnapshotSink, b []byte) error {
+		buf := new(bytes.Buffer)
+		sz := uint64(len(b))
+		err := binary.Write(buf, binary.LittleEndian, sz)
 		if err != nil {
 			return err
 		}
-		if _, err := sink.Write(b.Bytes()); err != nil {
+		if _, err := s.Write(buf.Bytes()); err != nil {
 			return err
 		}
-
-		// Next write database to sink.
-		if _, err := sink.Write(f.database); err != nil {
+		if _, err := s.Write(b); err != nil {
 			return err
 		}
+		return nil
+	}
 
-		// Finally write the meta.
-		if _, err := sink.Write(f.meta); err != nil {
-			return err
+	if err := func() error {
+		for _, b := range [][]byte{f.database, f.meta, f.connections} {
+			if err := sizeWriter(sink, b); err != nil {
+				return err
+			}
 		}
-
 		// Close the sink.
 		return sink.Close()
-	}()
-
-	if err != nil {
+	}(); err != nil {
 		sink.Cancel()
 		return err
 	}
@@ -872,4 +1467,21 @@ func enabledFromBool(b bool) string {
 		return "enabled"
 	}
 	return "disabled"
+}
+
+// pathExists returns true if the given path exists.
+func pathExists(p string) bool {
+	if _, err := os.Lstat(p); err != nil && os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+// tempfile returns a temporary file for use
+func tempfile() (*os.File, error) {
+	f, err := ioutil.TempFile("", "rqlilte-snap-")
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
 }

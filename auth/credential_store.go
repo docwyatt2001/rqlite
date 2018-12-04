@@ -5,6 +5,8 @@ package auth
 import (
 	"encoding/json"
 	"io"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // BasicAuther is the interface an object must support to return basic auth information.
@@ -67,7 +69,11 @@ func (c *CredentialsStore) Load(r io.Reader) error {
 // Check returns true if the password is correct for the given username.
 func (c *CredentialsStore) Check(username, password string) bool {
 	pw, ok := c.store[username]
-	return ok && password == pw
+	if !ok {
+		return false
+	}
+	return password == pw ||
+		bcrypt.CompareHashAndPassword([]byte(pw), []byte(password)) == nil
 }
 
 // CheckRequest returns true if b contains a valid username and password.
@@ -91,6 +97,19 @@ func (c *CredentialsStore) HasPerm(username string, perm string) bool {
 		return false
 	}
 	return true
+}
+
+// HasAnyPerm returns true if username has at least one of the given perms.
+// It does not perform any password checking.
+func (c *CredentialsStore) HasAnyPerm(username string, perm ...string) bool {
+	return func(p []string) bool {
+		for i := range p {
+			if c.HasPerm(username, p[i]) {
+				return true
+			}
+		}
+		return false
+	}(perm)
 }
 
 // HasPermRequest returns true if the username returned by b has the givem perm.

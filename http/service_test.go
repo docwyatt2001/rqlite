@@ -2,14 +2,19 @@ package http
 
 import (
 	"fmt"
+	"io"
+	"math/rand"
 	"net/http"
+	"regexp"
 	"testing"
+	"time"
 
-	sql "github.com/rqlite/rqlite/db"
 	"github.com/rqlite/rqlite/store"
 )
 
 func Test_NormalizeAddr(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		orig string
 		norm string
@@ -48,7 +53,9 @@ func Test_NormalizeAddr(t *testing.T) {
 }
 
 func Test_NewService(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if s == nil {
 		t.Fatalf("failed to create new service")
@@ -56,7 +63,9 @@ func Test_NewService(t *testing.T) {
 }
 
 func Test_HasVersionHeader(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -79,7 +88,9 @@ func Test_HasVersionHeader(t *testing.T) {
 }
 
 func Test_HasContentTypeJSON(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -99,7 +110,9 @@ func Test_HasContentTypeJSON(t *testing.T) {
 }
 
 func Test_HasContentTypeOctetStream(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -119,7 +132,9 @@ func Test_HasContentTypeOctetStream(t *testing.T) {
 }
 
 func Test_HasVersionHeaderUnknown(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -138,8 +153,37 @@ func Test_HasVersionHeaderUnknown(t *testing.T) {
 	}
 }
 
+func Test_CreateConnection(t *testing.T) {
+	t.Parallel()
+
+	m := NewMockStore()
+	s := New("127.0.0.1:0", m, nil)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start HTTP server: %s", err.Error())
+	}
+	defer s.Close()
+	r, err := http.Post(fmt.Sprintf("http://%s/db/connections", s.Addr().String()), "", nil)
+	if err != nil {
+		t.Fatalf("failed to make connections request: %s", err.Error())
+	}
+	if r.StatusCode != http.StatusCreated {
+		t.Fatalf("incorrect status code received: %s", r.Status)
+	}
+	loc, err := r.Location()
+	if err != nil {
+		t.Fatalf("failed to get Location header value: %s", err.Error())
+	}
+
+	re := regexp.MustCompile(fmt.Sprintf("^http://%s/db/connections/[0-9]+$", s.Addr().String()))
+	if !re.Match([]byte(loc.String())) {
+		t.Fatalf("connection URL is incorrect format: %s", loc.String())
+	}
+}
+
 func Test_404Routes(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -166,8 +210,40 @@ func Test_404Routes(t *testing.T) {
 	}
 }
 
+func Test_404Routes_ExpvarPprofDisabled(t *testing.T) {
+	t.Parallel()
+
+	m := NewMockStore()
+	s := New("127.0.0.1:0", m, nil)
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service")
+	}
+	defer s.Close()
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	client := &http.Client{}
+
+	for _, path := range []string{
+		"/debug/vars",
+		"/debug/pprof/cmdline",
+		"/debug/pprof/profile",
+		"/debug/pprof/symbol",
+	} {
+		req, err := http.NewRequest("GET", host+path, nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("failed to make request: %s", err.Error())
+		}
+		if resp.StatusCode != 404 {
+			t.Fatalf("failed to get expected 404 for path %s, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
 func Test_405Routes(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -227,7 +303,9 @@ func Test_405Routes(t *testing.T) {
 }
 
 func Test_400Routes(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
@@ -247,10 +325,14 @@ func Test_400Routes(t *testing.T) {
 }
 
 func Test_401Routes_NoBasicAuth(t *testing.T) {
+	t.Parallel()
+
 	c := &mockCredentialStore{CheckOK: false, HasPermOK: false}
 
-	m := &MockStore{}
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, c)
+	s.Expvar = true
+	s.Pprof = true
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
 	}
@@ -264,9 +346,14 @@ func Test_401Routes_NoBasicAuth(t *testing.T) {
 		"/db/query",
 		"/db/backup",
 		"/db/load",
+		"/db/connections",
 		"/join",
 		"/delete",
 		"/status",
+		"/debug/vars",
+		"/debug/pprof/cmdline",
+		"/debug/pprof/profile",
+		"/debug/pprof/symbol",
 	} {
 		resp, err := client.Get(host + path)
 		if err != nil {
@@ -279,10 +366,14 @@ func Test_401Routes_NoBasicAuth(t *testing.T) {
 }
 
 func Test_401Routes_BasicAuthBadPassword(t *testing.T) {
+	t.Parallel()
+
 	c := &mockCredentialStore{CheckOK: false, HasPermOK: false}
 
-	m := &MockStore{}
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, c)
+	s.Expvar = true
+	s.Pprof = true
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
 	}
@@ -296,8 +387,13 @@ func Test_401Routes_BasicAuthBadPassword(t *testing.T) {
 		"/db/query",
 		"/db/backup",
 		"/db/load",
+		"/db/connections",
 		"/join",
 		"/status",
+		"/debug/vars",
+		"/debug/pprof/cmdline",
+		"/debug/pprof/profile",
+		"/debug/pprof/symbol",
 	} {
 		req, err := http.NewRequest("GET", host+path, nil)
 		if err != nil {
@@ -316,10 +412,14 @@ func Test_401Routes_BasicAuthBadPassword(t *testing.T) {
 }
 
 func Test_401Routes_BasicAuthBadPerm(t *testing.T) {
+	t.Parallel()
+
 	c := &mockCredentialStore{CheckOK: true, HasPermOK: false}
 
-	m := &MockStore{}
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, c)
+	s.Expvar = true
+	s.Pprof = true
 	if err := s.Start(); err != nil {
 		t.Fatalf("failed to start service")
 	}
@@ -333,8 +433,13 @@ func Test_401Routes_BasicAuthBadPerm(t *testing.T) {
 		"/db/query",
 		"/db/backup",
 		"/db/load",
+		"/db/connections",
 		"/join",
 		"/status",
+		"/debug/vars",
+		"/debug/pprof/cmdline",
+		"/debug/pprof/profile",
+		"/debug/pprof/symbol",
 	} {
 		req, err := http.NewRequest("GET", host+path, nil)
 		if err != nil {
@@ -353,8 +458,10 @@ func Test_401Routes_BasicAuthBadPerm(t *testing.T) {
 }
 
 func Test_RegisterStatus(t *testing.T) {
+	t.Parallel()
+
 	var stats *mockStatuser
-	m := &MockStore{}
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 
 	if err := s.RegisterStatus("foo", stats); err != nil {
@@ -367,7 +474,9 @@ func Test_RegisterStatus(t *testing.T) {
 }
 
 func Test_FormRedirect(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	req := mustNewHTTPRequest("http://foo:4001")
 
@@ -380,7 +489,9 @@ func Test_FormRedirect(t *testing.T) {
 }
 
 func Test_FormRedirectParam(t *testing.T) {
-	m := &MockStore{}
+	t.Parallel()
+
+	m := NewMockStore()
 	s := New("127.0.0.1:0", m, nil)
 	req := mustNewHTTPRequest("http://foo:4001/db/query?x=y")
 
@@ -392,38 +503,138 @@ func Test_FormRedirectParam(t *testing.T) {
 	}
 }
 
-type MockStore struct {
-	executeFn func(queries []string, tx bool) ([]*sql.Result, error)
-	queryFn   func(queries []string, tx, leader, verify bool) ([]*sql.Rows, error)
+func Test_FormConnectionURL(t *testing.T) {
+	t.Parallel()
+
+	m := NewMockStore()
+	s := New("127.0.0.1:0", m, nil)
+
+	req := mustNewHTTPRequest("http://foo:4001/db/connections")
+	if got, exp := s.FormConnectionURL(req, 1234), "http://foo:4001/db/connections/1234"; got != exp {
+		t.Fatalf("failed to form redirect for URL:\ngot %s\nexp %s\n", got, exp)
+	}
+	req = mustNewHTTPRequest("http://foo/db/connections")
+	if got, exp := s.FormConnectionURL(req, 1234), "http://foo/db/connections/1234"; got != exp {
+		t.Fatalf("failed to form redirect for URL:\ngot %s\nexp %s\n", got, exp)
+	}
+	req = mustNewHTTPRequest("http://foo/db/connections?w=x&y=z")
+	if got, exp := s.FormConnectionURL(req, 1234), "http://foo/db/connections/1234"; got != exp {
+		t.Fatalf("failed to form redirect for URL:\ngot %s\nexp %s\n", got, exp)
+	}
 }
 
-func (m *MockStore) Execute(er *store.ExecuteRequest) ([]*sql.Result, error) {
+func Test_ConnectionTimingParams(t *testing.T) {
+	t.Parallel()
+
+	var d time.Duration
+	var b bool
+	var err error
+	var req *http.Request
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo?tx_timeout=1 0s", nil)
+	_, _, err = txTimeout(req)
+	if err == nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo?tx_timeout=10s", nil)
+	d, b, err = txTimeout(req)
+	if d != 10*time.Second || !b || err != nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo?tx_timeout=0s", nil)
+	d, b, err = txTimeout(req)
+	if d != 0 || !b || err != nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo", nil)
+	_, b, err = txTimeout(req)
+	if b || err != nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo?idle_timeout=1 0s", nil)
+	_, _, err = idleTimeout(req)
+	if err == nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo?idle_timeout=10s", nil)
+	d, b, err = idleTimeout(req)
+	if d != 10*time.Second || !b || err != nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo?idle_timeout=0s", nil)
+	d, b, err = idleTimeout(req)
+	if d != 0 || !b || err != nil {
+		t.Fatal("failed")
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, "http://foo", nil)
+	_, b, err = idleTimeout(req)
+	if b || err != nil {
+		t.Fatal("failed")
+	}
+
+}
+
+type MockStore struct {
+	executeFn func(queries []string, tx bool) (*store.ExecuteResponse, error)
+	queryFn   func(queries []string, tx, leader, verify bool) (*store.QueryResponse, error)
+	conns     map[uint64]*store.Connection
+}
+
+func NewMockStore() *MockStore {
+	return &MockStore{
+		conns: make(map[uint64]*store.Connection),
+	}
+}
+
+func (m *MockStore) Execute(er *store.ExecuteRequest) (*store.ExecuteResponse, error) {
 	if m.executeFn == nil {
 		return nil, nil
 	}
 	return nil, nil
 }
 
-func (m *MockStore) Query(qr *store.QueryRequest) ([]*sql.Rows, error) {
+func (m *MockStore) ExecuteOrAbort(er *store.ExecuteRequest) (*store.ExecuteResponse, error) {
+	return nil, nil
+}
+
+func (m *MockStore) Query(qr *store.QueryRequest) (*store.QueryResponse, error) {
 	if m.queryFn == nil {
 		return nil, nil
 	}
 	return nil, nil
 }
 
-func (m *MockStore) Join(addr string) error {
+func (m *MockStore) Connect(opt *store.ConnectionOptions) (*store.Connection, error) {
+	id := rand.Uint64()
+	m.conns[id] = store.NewConnection(nil, nil, id, 0, 0)
+	return m.conns[id], nil
+}
+
+func (m *MockStore) Connection(id uint64) (*store.Connection, bool) {
+	c, ok := m.conns[id]
+	return c, ok
+}
+
+func (m *MockStore) Join(id, addr string, metadata map[string]string) error {
 	return nil
 }
 
-func (m *MockStore) Remove(addr string) error {
+func (m *MockStore) Remove(id string) error {
 	return nil
 }
 
-func (m *MockStore) Leader() string {
-	return ""
+func (m *MockStore) LeaderID() (string, error) {
+	return "", nil
 }
 
-func (m *MockStore) Peer(addr string) string {
+func (m *MockStore) Metadata(id, key string) string {
 	return ""
 }
 
@@ -431,8 +642,8 @@ func (m *MockStore) Stats() (map[string]interface{}, error) {
 	return nil, nil
 }
 
-func (m *MockStore) Backup(leader bool) ([]byte, error) {
-	return nil, nil
+func (m *MockStore) Backup(leader bool, f store.BackupFormat, w io.Writer) error {
+	return nil
 }
 
 type mockCredentialStore struct {
@@ -445,6 +656,10 @@ func (m *mockCredentialStore) Check(username, password string) bool {
 }
 
 func (m *mockCredentialStore) HasPerm(username, perm string) bool {
+	return m.HasPermOK
+}
+
+func (m *mockCredentialStore) HasAnyPerm(username string, perm ...string) bool {
 	return m.HasPermOK
 }
 

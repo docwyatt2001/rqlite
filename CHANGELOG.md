@@ -1,3 +1,57 @@
+## 5.0.0 (unreleased)
+_To upgrade from an earlier version to this release you should backup the leader node, and load the resultant database dump into a new 5.0 leader node. Check out [BACKUP.md](https://github.com/rqlite/rqlite/blob/master/DOC/BACKUPS.md) for more details._
+
+### New features
+- [PR #406](https://github.com/rqlite/rqlite/pull/406), [PR #408](https://github.com/rqlite/rqlite/pull/408): CLI supports Basic Auth credentials. Fixes [issue #369](https://github.com/rqlite/rqlite/issues/369). Thanks @joaodrp.
+- [PR #414](https://github.com/rqlite/rqlite/pull/414), [PR #416](https://github.com/rqlite/rqlite/pull/416): Support display of query timings in CLI. Fixes [issue #317](https://github.com/rqlite/rqlite/issues/317). Thanks @joaodrp.
+- [PR #436](https://github.com/rqlite/rqlite/pull/436): Add backup command to CLI. Fixes [issue #432](https://github.com/rqlite/rqlite/issues/432). Thanks @eariassoto.
+- [PR #444](https://github.com/rqlite/rqlite/pull/444): Add basic [expvar](https://golang.org/pkg/expvar/) statistics to the Store.
+- [PR #450](https://github.com/rqlite/rqlite/pull/450): Add restore command to CLI. Fixes [issue #439](https://github.com/rqlite/rqlite/issues/439). Thanks @eariassoto.
+- [PR #451](https://github.com/rqlite/rqlite/pull/451), [PR #453](https://github.com/rqlite/rqlite/pull/453): Support dumping database in SQL text format via the API. Fixes [issue #393](https://github.com/rqlite/rqlite/issues/369).
+- [PR #455](https://github.com/rqlite/rqlite/pull/455): Add dump-as-SQL-text command to CLI.
+- [PR #462](https://github.com/rqlite/rqlite/pull/462): Add Raft metadata to responses to requests that modify Raft log.
+- [PR #493](https://github.com/rqlite/rqlite/pull/504), [PR #504](https://github.com/rqlite/rqlite/pull/504): Full connection control and distributed transactions over HTTP.
+- [PR #501](https://github.com/rqlite/rqlite/pull/501): Replace use of term "transaction" with "atomic".
+- [PR #527](https://github.com/rqlite/rqlite/pull/527): rqlite CLI now supports command history. Thanks @rhnvrm.
+
+### Design and implementation changes
+- [End-to-end integration test](https://github.com/rqlite/rqlite/blob/master/system_test/full_system_test.py) added. Written in Python, it is automatically run by CircleCI as the committed source changes.
+- [PR #377](https://github.com/rqlite/rqlite/pull/377): Upgrade consensus system to Hashicorp Raft v1.0.
+- [PR #401](https://github.com/rqlite/rqlite/pull/401): Always try to close temporary database file after backup. Fixes [issue #400](https://github.com/rqlite/rqlite/issues/400). Thanks @sum12.
+- [PR #411](https://github.com/rqlite/rqlite/pull/411), [PR #412](https://github.com/rqlite/rqlite/pull/412): Remove any pre-existing node with a given ID, if that node rejoins with a new IP address. Fixes [issue #409](https://github.com/rqlite/rqlite/issues/409).
+- [PR #425](https://github.com/rqlite/rqlite/pull/425): By default use Raft network address as node ID. Fixes [issue #422](https://github.com/rqlite/rqlite/issues/422).
+- [PR #430](https://github.com/rqlite/rqlite/pull/430): Close Raft log on Store close. Fixes [issue #429](https://github.com/rqlite/rqlite/issues/429).
+- [PR #431](https://github.com/rqlite/rqlite/pull/431): Add function to Store that returns Raft leader ID.
+- [PR #434](https://github.com/rqlite/rqlite/pull/434): Broadcast Cluster metadata via Raft consensus mechanism. Fixes [issue #138](https://github.com/rqlite/rqlite/issues/138).
+- [PR #437](https://github.com/rqlite/rqlite/pull/437), [PR #438](https://github.com/rqlite/rqlite/pull/438): Make keys in diagnostic status output more consistent.
+- [PR #448](https://github.com/rqlite/rqlite/pull/448): Support Store aborting transaction on any Execute error. Fixes [issue #385](https://github.com/rqlite/rqlite/issues/385).
+- [PR #452](https://github.com/rqlite/rqlite/pull/452): Move to Go 1.10.
+- [PR #457](https://github.com/rqlite/rqlite/pull/457): Implement new connection-oriented database layer.
+- [PR #463](https://github.com/rqlite/rqlite/pull/463): Fix DSN key in Status output.
+- [PR #461](https://github.com/rqlite/rqlite/pull/461): Write node backup directly to HTTP response writer. Thanks @sum12.
+- [PR #471](https://github.com/rqlite/rqlite/pull/471): Cache most recent Raft log entries.
+- [PR #466](https://github.com/rqlite/rqlite/pull/466): Port HTTP service to new connection-oriented design.
+- [PR #486](https://github.com/rqlite/rqlite/pull/486): Store connections in Raft snapshot.
+- [PR #491](https://github.com/rqlite/rqlite/pull/491): Add varadic utility functions to Auth credential store.
+- [PR #494](https://github.com/rqlite/rqlite/pull/494): JSON types are stored as text by SQLite. Fixes [issue #492](https://github.com/rqlite/rqlite/issues/492).
+- [PR #518](https://github.com/rqlite/rqlite/pull/518): Move testing to CircleCI 2.0.
+- [PR #521](https://github.com/rqlite/rqlite/pull/521): Don't ignore any Join error, return it.
+- [PR #531](https://github.com/rqlite/rqlite/pull/531): Protect against possible nil pointer. Thanks @runsisi
+
+## 4.3.1 (October 10th 2018)
+- Allow a node to be re-added with same IP address and port, even though it was previously removed. Fixes [issue #534](https://github.com/rqlite/rqlite/issues/534).
+
+## 4.3.0 (March 18th 2018)
+- [PR #397](https://github.com/rqlite/rqlite/pull/397), [PR #399](https://github.com/rqlite/rqlite/pull/399): Support hashed passwords. Fixes [issue #395](https://github.com/rqlite/rqlite/issues/395). Thanks @sum12.
+
+## 4.2.3 (February 21st 2018)
+- [PR #389](https://github.com/rqlite/rqlite/pull/389): Log Store directory path on startup.
+- [PR #392](https://github.com/rqlite/rqlite/pull/392): Return redirect if node removal attempted on follower. Fixes [issue #391](https://github.com/rqlite/rqlite/issues/391).
+
+## 4.2.2 (December 7th 2017)
+- [PR #383](https://github.com/rqlite/rqlite/pull/383): Fix unit tests after underlying SQLite master table changes.
+- [PR #384](https://github.com/rqlite/rqlite/pull/384): "status" perm required to access Go runtime information.
+
 ## 4.2.1 (November 10th 2017)
 - [PR #367](https://github.com/rqlite/rqlite/pull/367): Remove superflous leading space at CLI prompt.
 - [PR #368](https://github.com/rqlite/rqlite/pull/368): CLI displays clear error message when not authorized.
@@ -135,7 +189,7 @@
 - [PR #117](https://github.com/rqlite/rqlite/pull/117): Use Raft advertise address, if exists, during join.
 
 ## 3.0.0 (May 1st 2016)
-**The Raft log format in 3.0 is not compatible with the 2.0 series**. To upgrade from an earlier version to this release you should backup your 2.0 master node, and replay the database dump into a new 3.0 cluster. The HTTP API remains unchanged however.
+**The Raft log format in 3.0 is not compatible with the 2.0 series**. To upgrade from an earlier version to this release you should backup your 2.0 leader node, and replay the database dump into a new 3.0 cluster. The HTTP API remains unchanged however.
 
 - [PR #116](https://github.com/rqlite/rqlite/pull/116): Allow HTTP advertise address to be set.
 - [PR #115](https://github.com/rqlite/rqlite/pull/115): Support advertising address different than Raft bind address.

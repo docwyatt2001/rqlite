@@ -28,7 +28,7 @@ rqlite supports encryption of all inter-node traffic. To enable this, pass `-nod
 You can generate private keys and associated certificates in a similar manner as described in the _HTTP API_ section.
 
 ## Basic Auth
-The HTTP API supports [Basic Auth](https://tools.ietf.org/html/rfc2617). Each rqlite node can be passed a JSON-formatted configuration file, which configures valid usernames and associated passwords for that node.
+The HTTP API supports [Basic Auth](https://tools.ietf.org/html/rfc2617). Each rqlite node can be passed a JSON-formatted configuration file, which configures valid usernames and associated passwords for that node. The password string can be in cleartext or [bcrypt hashed](https://en.wikipedia.org/wiki/Bcrypt).
 
 Since the configuration file only controls the node local to it, it's important to ensure the configuration is correct on each node.
 
@@ -39,8 +39,8 @@ rqlite, via the configuration file, also supports user-level permissions. Each u
 - _query_: user may access the query endpoint.
 - _load_: user may load an SQLite dump file into a node.
 - _backup_: user may perform backups.
-- _status_: user can retrieve status information from the node.
-- _join_: user can join a cluster. In practice only a node joins a cluster.
+- _status_: user can retrieve status and Go runtime information.
+- _join_: user can join a cluster. In practice only a node joins a cluster, so it's the joining node that must supply the credentials.
 - _remove_: user can remove a node from a cluster.
 
 ### Example configuration file
@@ -54,7 +54,7 @@ An example configuration file is shown below.
   },
   {
     "username": "mary",
-    "password": "secret2",
+    "password": "$2a$10$fKRHxrEuyDTP6tXIiDycr.nyC8Q7UMIfc31YMyXHDLgRDyhLK3VFS",
     "perms": ["query", "status"]
   }
 ]

@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/mkideal/cli"
 )
@@ -20,10 +23,34 @@ type executeResponse struct {
 	Time    float64   `json:"time,omitempty"`
 }
 
-func execute(ctx *cli.Context, cmd, line string, argv *argT) error {
-	urlStr := fmt.Sprintf("%s://%s:%d%sdb/execute", argv.Protocol, argv.Host, argv.Port, argv.Prefix)
+func makeExecuteRequest(line string) func(string) (*http.Request, error) {
+	requestData := strings.NewReader(makeJSONBody(line))
+	return func(urlStr string) (*http.Request, error) {
+		req, err := http.NewRequest("POST", urlStr, requestData)
+		if err != nil {
+			return nil, err
+		}
+		return req, nil
+	}
+}
+
+func execute(ctx *cli.Context, cmd, line string, timer bool, argv *argT) error {
+	queryStr := url.Values{}
+	if timer {
+		queryStr.Set("timings", "")
+	}
+	u := url.URL{
+		Scheme:   argv.Protocol,
+		Host:     fmt.Sprintf("%s:%d", argv.Host, argv.Port),
+		Path:     fmt.Sprintf("%sdb/execute", argv.Prefix),
+		RawQuery: queryStr.Encode(),
+	}
+	response, err := sendRequest(ctx, makeExecuteRequest(line), u.String(), argv)
+	if err != nil {
+		return err
+	}
 	ret := &executeResponse{}
-	if err := sendRequest(ctx, urlStr, line, argv, ret); err != nil {
+	if err := parseResponse(response, &ret); err != nil {
 		return err
 	}
 	if ret.Error != "" {

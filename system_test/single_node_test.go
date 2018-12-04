@@ -4,10 +4,13 @@ Package system runs system-level testing of rqlite. This includes testing of sin
 package system
 
 import (
+	"fmt"
 	"testing"
 )
 
 func Test_SingleNode(t *testing.T) {
+	t.Parallel()
+
 	node := mustNewLeaderNode()
 	defer node.Deprovision()
 
@@ -18,22 +21,22 @@ func Test_SingleNode(t *testing.T) {
 	}{
 		{
 			stmt:     `CREATE TABLE foo (id integer not null primary key, name text)`,
-			expected: `{"results":[{}]}`,
+			expected: fmt.Sprintf(`{"results":[{}],%s}`, rr(node.ID, 3)),
 			execute:  true,
 		},
 		{
 			stmt:     `INSERT INTO foo(name) VALUES("fiona")`,
-			expected: `{"results":[{"last_insert_id":1,"rows_affected":1}]}`,
+			expected: fmt.Sprintf(`{"results":[{"last_insert_id":1,"rows_affected":1}],%s}`, rr(node.ID, 4)),
 			execute:  true,
 		},
 		{
 			stmt:     `INSERT INTO bar(name) VALUES("fiona")`,
-			expected: `{"results":[{"error":"no such table: bar"}]}`,
+			expected: fmt.Sprintf(`{"results":[{"error":"no such table: bar"}],%s}`, rr(node.ID, 5)),
 			execute:  true,
 		},
 		{
 			stmt:     `INSERT blah blah`,
-			expected: `{"results":[{"error":"near \"blah\": syntax error"}]}`,
+			expected: fmt.Sprintf(`{"results":[{"error":"near \"blah\": syntax error"}],%s}`, rr(node.ID, 6)),
 			execute:  true,
 		},
 		{
@@ -43,12 +46,12 @@ func Test_SingleNode(t *testing.T) {
 		},
 		{
 			stmt:     `DROP TABLE bar`,
-			expected: `{"results":[{"error":"no such table: bar"}]}`,
+			expected: fmt.Sprintf(`{"results":[{"error":"no such table: bar"}],%s}`, rr(node.ID, 7)),
 			execute:  true,
 		},
 		{
 			stmt:     `DROP TABLE foo`,
-			expected: `{"results":[{"last_insert_id":1,"rows_affected":1}]}`,
+			expected: fmt.Sprintf(`{"results":[{"last_insert_id":1,"rows_affected":1}],%s}`, rr(node.ID, 8)),
 			execute:  true,
 		},
 	}
@@ -71,6 +74,8 @@ func Test_SingleNode(t *testing.T) {
 }
 
 func Test_SingleNodeMulti(t *testing.T) {
+	t.Parallel()
+
 	node := mustNewLeaderNode()
 	defer node.Deprovision()
 
@@ -81,27 +86,27 @@ func Test_SingleNodeMulti(t *testing.T) {
 	}{
 		{
 			stmt:     `CREATE TABLE foo (id integer not null primary key, name text)`,
-			expected: `{"results":[{}]}`,
+			expected: fmt.Sprintf(`{"results":[{}],%s}`, rr(node.ID, 3)),
 			execute:  true,
 		},
 		{
 			stmt:     `CREATE TABLE bar (id integer not null primary key, sequence integer)`,
-			expected: `{"results":[{}]}`,
+			expected: fmt.Sprintf(`{"results":[{}],%s}`, rr(node.ID, 4)),
 			execute:  true,
 		},
 		{
 			stmt:     `INSERT INTO foo(name) VALUES("fiona")`,
-			expected: `{"results":[{"last_insert_id":1,"rows_affected":1}]}`,
+			expected: fmt.Sprintf(`{"results":[{"last_insert_id":1,"rows_affected":1}],%s}`, rr(node.ID, 5)),
 			execute:  true,
 		},
 		{
 			stmt:     `INSERT INTO foo(name) VALUES("declan")`,
-			expected: `{"results":[{"last_insert_id":2,"rows_affected":1}]}`,
+			expected: fmt.Sprintf(`{"results":[{"last_insert_id":2,"rows_affected":1}],%s}`, rr(node.ID, 6)),
 			execute:  true,
 		},
 		{
 			stmt:     `INSERT INTO bar(sequence) VALUES(5)`,
-			expected: `{"results":[{"last_insert_id":1,"rows_affected":1}]}`,
+			expected: fmt.Sprintf(`{"results":[{"last_insert_id":1,"rows_affected":1}],%s}`, rr(node.ID, 7)),
 			execute:  true,
 		},
 	}
@@ -132,6 +137,8 @@ func Test_SingleNodeMulti(t *testing.T) {
 }
 
 func Test_SingleNodeCoverage(t *testing.T) {
+	t.Parallel()
+
 	node := mustNewLeaderNode()
 	defer node.Deprovision()
 

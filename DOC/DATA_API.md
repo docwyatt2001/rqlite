@@ -1,8 +1,9 @@
 # Data API
+_This is the documentation for the upcoming release, 5.0. The documentation for the 4.0 series can be found [here](https://github.com/rqlite/rqlite/tree/v4.3.0/DOC)._
 
 rqlite exposes an HTTP API allowing the database to be modified such that the changes are replicated. Queries are also executed using the HTTP API.
 
-All write-requests must be sent to the leader of the cluster. Queries, however, may be sent to any node, depending on the [read-consistency](https://github.com/rqlite/rqlite/blob/master/doc/CONSISTENCY.md) requirements. But, by default, queries must also be sent to the leader.
+All write-requests must be sent to the leader of the cluster. Queries, however, may be sent to any node, depending on the [read-consistency](https://github.com/rqlite/rqlite/blob/master/DOC/CONSISTENCY.md) requirements. But, by default, queries must also be sent to the leader.
 
 There are [client libraries available](https://github.com/rqlite).
 
@@ -37,11 +38,17 @@ The response is of the form:
             "time": 0.00886
         }
     ],
-    "time": 0.0152
+    "time": 0.0152,
+    "raft": {
+        "index": 43,
+        "node_id": "14f66175-eb70-4b64-a716-d5a16c91fcaa"
+    }
 }
 ```
 
 The use of the URL param `pretty` is optional, and results in pretty-printed JSON responses. Time is measured in seconds. If you do not want timings, do not pass `timings` as a URL parameter.
+
+The `raft` section includes the index of the new entry, corresponding to the write command, in the Raft log. It also includes the node ID of the leader, on which the change was committed. Most applications can ignore this section, but it is included for informational purposes.
 
 ## Querying Data
 Querying data is easy. The most important thing to know is that, by default, queries must go through the leader node. 
@@ -82,19 +89,19 @@ The response is of the form:
 ### Read Consistency
 You can learn all about the read consistency guarantees supported by rqlite [here](https://github.com/rqlite/rqlite/blob/master/DOC/CONSISTENCY.md).
 
-## Transactions
-Transactions are supported. To execute statements within a transaction, add `transaction` to the URL. An example of the above operation executed within a transaction is shown below.
+## Atomic changes
+You can execute a set commands in an _atomic_ fashion. When executed atomically, either all commands in the request will fail, or none of them. To execute statements atomically, add `atomic` to the URL. An example of the above operation executed atomically is shown below.
 
 ```bash
-curl -XPOST 'localhost:4001/db/execute?pretty&transaction' -H "Content-Type: application/json" -d "[
+curl -XPOST 'localhost:4001/db/execute?pretty&atomic' -H "Content-Type: application/json" -d "[
     \"INSERT INTO foo(name) VALUES('fiona')\",
     \"INSERT INTO foo(name) VALUES('sinead')\"
 ]"
 ```
 
-When a transaction takes place either both statements will succeed, or neither. Performance is *much, much* better if multiple SQL INSERTs or UPDATEs are executed via a transaction. Note that processing of the request ceases the moment any single query results in an error.
+When a such a request takes place either both statements will succeed, or neither. Performance is *much, much* better if multiple SQL INSERTs or UPDATEs are executed in this manner. Note that processing of the request ceases the moment any single query results in an error.
 
-The behaviour of rqlite when using `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` to control transactions is **not defined**. It is important to control transactions only through the query parameters shown above.
+The behaviour of rqlite when using `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, and `RELEASE` to control transaction-like behavior is **not defined**. It is important to control atomic behavior only through the query parameters shown above.
 
 ## Handling Errors
 If an error occurs while processing a statement, it will be marked as such in the response. For example:
@@ -111,7 +118,11 @@ curl -XPOST 'localhost:4001/db/execute?pretty&timings' -H "Content-Type: applica
             "error": "near \"nonsense\": syntax error"
         }
     ],
-    "time": 2.478862
+    "time": 2.478862,
+    "raft": {
+        "index": 327,
+        "node_id": "14f66175-eb70-4b64-a716-d5a16c91fcaa"
+    }
 }
 ```
 
@@ -147,11 +158,9 @@ $ curl -v -G 'localhost:4003/db/query?pretty&timings' --data-urlencode 'q=SELECT
 
 * Connection #0 to host localhost left intact
 ```
-It is up the clients to re-issue the command to the leader.
+It is then up to the client to re-issue the command to the leader.
 
 This choice was made, as it provides maximum visibility to the clients. For example, if a follower transparently forwarded a request to the leader, and one of the nodes then crashed during processing, it may be much harder for the client to determine where in the chain of nodes the processing failed.
 
 ## Bulk API
 You can learn about the bulk API [here](https://github.com/rqlite/rqlite/blob/master/DOC/BULK.md).
-
-
